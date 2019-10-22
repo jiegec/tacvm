@@ -1,7 +1,7 @@
 use std::io::{self, Write, BufRead, BufReader};
 use crate::mem::Mem;
 use crate::error::Error;
-use crate::program::{Program, Inst, VTblSlot, Operand};
+use crate::program::{Program, Inst, VTblSlot, Operand, Func};
 use crate::util::ReadHelper;
 
 pub struct RunConfig {
@@ -45,7 +45,11 @@ pub struct VM<'a> {
   program: &'a Program<'a>,
   str_addr: Vec<i32>,
   vtbl_addr: Vec<u32>,
+  func: &'a Func<'a>,
+  arg: Vec<i32>,
+  ret: i32,
 }
+
 
 impl VM<'_> {
   // there shouldn't be any error here, so call unwrap() for Option or Result
@@ -64,7 +68,7 @@ impl VM<'_> {
         mem.store(addr, idx as i32 * 4, data).unwrap();
       }
     }
-    VM { pc: 0, inst_count: 0, mem, stack: vec![], program: p, str_addr, vtbl_addr }
+    VM { pc: 0, inst_count: 0, mem, stack: vec![], program: p, str_addr, vtbl_addr, func: &p.func[p.entry as usize], arg: Vec::new(), ret: 0 }
   }
 
   pub fn run(&mut self, cfg: &mut RunConfig) -> io::Result<()> {
@@ -81,65 +85,78 @@ impl VM<'_> {
     Ok(())
   }
 
+  // Returns Ok(true) when main returns
+  fn step(&mut self, cfg: &mut RunConfig) -> Result<bool, Error> {
+    use Inst::*;
+    let p = self.program;
+    let frame = self.stack.last_mut().unwrap();
+    let stk = frame.data.as_mut();
+    let inst = *self.func.code.get(self.pc as usize).ok_or(Error::IFOutOfRange)?;
+    (self.pc += 1, self.inst_count += 1);
+    match inst {
+      BinRR(op, d, l, r) => stk[d as usize] = op.eval(stk[l as usize], stk[r as usize]).ok_or(Error::Div0)?,
+      BinRC(op, d, l, r) => stk[d as usize] = op.eval(stk[l as usize], r).ok_or(Error::Div0)?,
+      BinCR(op, d, l, r) => stk[d as usize] = op.eval(l, stk[r as usize]).ok_or(Error::Div0)?,
+      Neg(d, r) => stk[d as usize] = stk[r as usize].wrapping_neg(),
+      Not(d, r) => stk[d as usize] = (stk[r as usize] == 0) as i32,
+      Mv(d, r) => stk[d as usize] = stk[r as usize],
+      Li(d, i) => stk[d as usize] = i,
+      LStr(d, s) => stk[d as usize] = self.str_addr[s as usize],
+      LVTbl(d, v) => stk[d as usize] = self.vtbl_addr[v as usize] as i32,
+      ParamR(r) => self.arg.push(stk[r as usize]),
+      ParamC(c) => self.arg.push(c),
+      Intrinsic(i) => {
+        self.ret = i(*self.arg.get(0).unwrap_or(&0), *self.arg.get(1).unwrap_or(&0), &mut self.mem, cfg)?;
+        self.arg.clear();
+      }
+      Call(f) => {
+        let f = match f { Operand::Reg(r) => stk[r as usize], Operand::Const(c) => c };
+        self.func = p.func.get(f as usize).ok_or(Error::CallOutOfRange)?;
+        if self.func.stack_size < self.arg.len() as u32 { return Err(Error::TooMuchArg); }
+        (frame.pc = self.pc, self.pc = 0);
+        if cfg.stack_limit < self.stack.len() as u32 { return Err(Error::StackOverflow); }
+        self.stack.push(Frame::new(f as u32, self.func.stack_size));
+        let stk = self.stack.last_mut().unwrap().data.as_mut();
+        stk[0..self.arg.len()].copy_from_slice(&self.arg);
+        self.arg.clear();
+      }
+      GetRet(d) => stk[d as usize] = self.ret,
+      Ret(r) => {
+        if let Some(r) = r {
+          self.ret = match r { Operand::Reg(r) => stk[r as usize], Operand::Const(c) => c };
+        }
+        self.stack.pop();
+        if let Some(frame) = self.stack.last_mut() {
+          self.pc = frame.pc;
+          self.func = &p.func[frame.func as usize];
+        } else { return Ok(true); } // `main` returns
+      }
+      J(l) => self.pc = l,
+      Bz(r, l) => if stk[r as usize] == 0 { self.pc = l; }
+      Bnz(r, l) => if stk[r as usize] != 0 { self.pc = l; }
+      Load(d, base, off) => stk[d as usize] = self.mem.load(stk[base as usize] as u32, off)?,
+      StoreR(r, base, off) => self.mem.store(stk[base as usize] as u32, off, stk[r as usize])?,
+      StoreC(c, base, off) => self.mem.store(stk[base as usize] as u32, off, c)?,
+    }
+    Ok(false)
+  }
+
+  fn restart(&mut self) {
+    let p = self.program;
+    self.func = &p.func[p.entry as usize];
+    self.arg = Vec::new();
+    self.ret = 0; // like the %eax or $v0 register
+    (self.pc = 0, self.inst_count = 0);
+    (self.stack.clear(), self.stack.push(Frame::new(p.entry, self.func.stack_size)));
+  }
+
   // return Ok(()): `main` returns normally
   // return Err(...): any other case
   fn run_impl(&mut self, cfg: &mut RunConfig) -> Result<(), Error> {
-    let p = self.program;
-    let mut func = &p.func[p.entry as usize];
-    let mut arg = Vec::new();
-    let mut ret = 0; // like the %eax or $v0 register
-    (self.pc = 0, self.inst_count = 0);
-    (self.stack.clear(), self.stack.push(Frame::new(p.entry, func.stack_size)));
+    self.restart();
     for _ in 0..cfg.inst_limit {
-      use Inst::*;
-      let frame = self.stack.last_mut().unwrap();
-      let stk = frame.data.as_mut();
-      let inst = *func.code.get(self.pc as usize).ok_or(Error::IFOutOfRange)?;
-      (self.pc += 1, self.inst_count += 1);
-      match inst {
-        BinRR(op, d, l, r) => stk[d as usize] = op.eval(stk[l as usize], stk[r as usize]).ok_or(Error::Div0)?,
-        BinRC(op, d, l, r) => stk[d as usize] = op.eval(stk[l as usize], r).ok_or(Error::Div0)?,
-        BinCR(op, d, l, r) => stk[d as usize] = op.eval(l, stk[r as usize]).ok_or(Error::Div0)?,
-        Neg(d, r) => stk[d as usize] = stk[r as usize].wrapping_neg(),
-        Not(d, r) => stk[d as usize] = (stk[r as usize] == 0) as i32,
-        Mv(d, r) => stk[d as usize] = stk[r as usize],
-        Li(d, i) => stk[d as usize] = i,
-        LStr(d, s) => stk[d as usize] = self.str_addr[s as usize],
-        LVTbl(d, v) => stk[d as usize] = self.vtbl_addr[v as usize] as i32,
-        ParamR(r) => arg.push(stk[r as usize]),
-        ParamC(c) => arg.push(c),
-        Intrinsic(i) => {
-          ret = i(*arg.get(0).unwrap_or(&0), *arg.get(1).unwrap_or(&0), &mut self.mem, cfg)?;
-          arg.clear();
-        }
-        Call(f) => {
-          let f = match f { Operand::Reg(r) => stk[r as usize], Operand::Const(c) => c };
-          func = p.func.get(f as usize).ok_or(Error::CallOutOfRange)?;
-          if func.stack_size < arg.len() as u32 { return Err(Error::TooMuchArg); }
-          (frame.pc = self.pc, self.pc = 0);
-          if cfg.stack_limit < self.stack.len() as u32 { return Err(Error::StackOverflow); }
-          self.stack.push(Frame::new(f as u32, func.stack_size));
-          let stk = self.stack.last_mut().unwrap().data.as_mut();
-          stk[0..arg.len()].copy_from_slice(&arg);
-          arg.clear();
-        }
-        GetRet(d) => stk[d as usize] = ret,
-        Ret(r) => {
-          if let Some(r) = r {
-            ret = match r { Operand::Reg(r) => stk[r as usize], Operand::Const(c) => c };
-          }
-          self.stack.pop();
-          if let Some(frame) = self.stack.last_mut() {
-            self.pc = frame.pc;
-            func = &p.func[frame.func as usize];
-          } else { return Ok(()); } // `main` returns
-        }
-        J(l) => self.pc = l,
-        Bz(r, l) => if stk[r as usize] == 0 { self.pc = l; }
-        Bnz(r, l) => if stk[r as usize] != 0 { self.pc = l; }
-        Load(d, base, off) => stk[d as usize] = self.mem.load(stk[base as usize] as u32, off)?,
-        StoreR(r, base, off) => self.mem.store(stk[base as usize] as u32, off, stk[r as usize])?,
-        StoreC(c, base, off) => self.mem.store(stk[base as usize] as u32, off, c)?,
+      if self.step(cfg)? {
+        return Ok(());
       }
     }
     Err(Error::TLE)
